@@ -1,0 +1,33 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.db
+.coverage
+
+# Node.js
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+.env.local
+
+# Data and notebooks
+ai-engine/data/raw/*
+!ai-engine/data/raw/.gitkeep
+ai-engine/data/processed/*
+!ai-engine/data/processed/.gitkeep
+.ipynb_checkpoints/
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
