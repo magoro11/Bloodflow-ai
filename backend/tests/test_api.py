@@ -1,3 +1,7 @@
+from app.services.backtesting import backtest_moving_average
+from app.models import BloodUnit, DemandHistory, Facility
+from app.services.forecasting import moving_average_forecast
+
 from datetime import date, timedelta
 
 import pytest
@@ -323,3 +327,339 @@ def test_forecast_validation_and_demo_shortage_alert(client):
     alerts = client.get("/api/alerts", headers={"Authorization": f"Bearer {admin}"}).json()
     assert len(alerts) < 50
     assert any(item["risk_level"] == "expiry" and item["eligible_stock"] > 1 for item in alerts)
+
+def test_forecast_aggregates_multiple_records_on_same_day(client):
+    with database.SessionLocal() as db:
+        facility = db.query(Facility).filter_by(name="Nairobi Central Blood Centre").first()
+        assert facility is not None
+
+        today = date.today()
+
+        db.add_all([
+            DemandHistory(
+                facility_id=facility.id,
+                blood_group="O+",
+                component="red_blood_cells",
+                demand_date=today,
+                units_requested=10,
+            ),
+            DemandHistory(
+                facility_id=facility.id,
+                blood_group="O+",
+                component="red_blood_cells",
+                demand_date=today,
+                units_requested=20,
+            ),
+        ])
+        db.commit()
+
+        result = moving_average_forecast(
+            db, facility.id, "O+", "red_blood_cells", 7
+        )
+
+        # Seeded records also exist, so this test checks that the
+        # duplicate records are included in the daily total.
+        assert result["daily_average"] > 0
+        assert result["model"] == "trailing_28_day_daily_average"
+
+
+def test_forecast_ignores_demand_older_than_28_days(client):
+    with database.SessionLocal() as db:
+        facility = db.query(Facility).filter_by(name="Nairobi Central Blood Centre").first()
+        assert facility is not None
+
+        old_date = date.today() - timedelta(days=40)
+
+        db.add(DemandHistory(
+            facility_id=facility.id,
+            blood_group="O+",
+            component="red_blood_cells",
+            demand_date=old_date,
+            units_requested=10000,
+        ))
+        db.commit()
+
+        result = moving_average_forecast(
+            db, facility.id, "O+", "red_blood_cells", 7
+        )
+
+        assert result["daily_average"] < 10000
+
+
+def test_forecast_does_not_treat_missing_dates_as_zero(client):
+    with database.SessionLocal() as db:
+        facility = db.query(Facility).filter_by(name="Nairobi Central Blood Centre").first()
+        assert facility is not None
+
+        result = moving_average_forecast(
+            db, facility.id, "O+", "red_blood_cells", 7
+        )
+
+        # The seeded dataset has recorded demand on each of the
+        # most recent 28 dates. The result should remain positive.
+        assert result["daily_average"] > 0
+        assert result["predicted_demand"] > 0
+
+
+def test_backtest_compares_forecast_with_full_horizon_actual(client):
+    from datetime import date, timedelta
+
+    with database.SessionLocal() as db:
+        facility = db.query(Facility).first()
+        assert facility is not None
+
+        group = "A+"
+        component = "red_blood_cells"
+        today = date.today()
+
+        db.query(DemandHistory).filter(
+            DemandHistory.facility_id == facility.id,
+            DemandHistory.blood_group == group,
+            DemandHistory.component == component,
+        ).delete(synchronize_session=False)
+
+        first_origin = today - timedelta(days=9)
+        history_start = first_origin - timedelta(days=28)
+
+        records = []
+
+        for offset in range((today - history_start).days + 1):
+            demand_date = history_start + timedelta(days=offset)
+
+            # Training demand is 2 units per day.
+            # Evaluation-period demand is 4 units per day.
+            units = 4 if demand_date >= today - timedelta(days=8) else 2
+
+            records.append(
+                DemandHistory(
+                    facility_id=facility.id,
+                    blood_group=group,
+                    component=component,
+                    demand_date=demand_date,
+                    units_requested=units,
+                )
+            )
+
+        db.add_all(records)
+        db.commit()
+
+        result = backtest_moving_average(
+            db=db,
+            facility_id=facility.id,
+            blood_group=group,
+            component=component,
+            horizon_days=7,
+            evaluation_days=3,
+            minimum_training_days=14,
+        )
+
+        assert result["available"] is True
+        assert result["evaluation_count"] == 3
+
+        # 2 units/day x 7 days = 14 predicted units.
+        assert result["results"][0]["predicted_demand"] == 14
+
+        # 4 units/day x 7 days = 28 actual units.
+        assert result["results"][0]["actual_demand"] == 28
+
+        assert result["mae"] == 13.833
+        assert result["wape"] == 49.4
+        assert result["rmse"] == 13.835
+
+
+def test_backtest_skips_incomplete_target_windows(client):
+    from datetime import date, timedelta
+
+    with database.SessionLocal() as db:
+        facility = db.query(Facility).first()
+        assert facility is not None
+
+        group = "A+"
+        component = "red_blood_cells"
+        today = date.today()
+
+        db.query(DemandHistory).filter(
+            DemandHistory.facility_id == facility.id,
+            DemandHistory.blood_group == group,
+            DemandHistory.component == component,
+        ).delete(synchronize_session=False)
+
+        first_origin = today - timedelta(days=9)
+        history_start = first_origin - timedelta(days=28)
+
+        # Provide training history, but no target-period observations.
+        records = [
+            DemandHistory(
+                facility_id=facility.id,
+                blood_group=group,
+                component=component,
+                demand_date=history_start + timedelta(days=offset),
+                units_requested=2,
+            )
+            for offset in range(28)
+        ]
+
+        db.add_all(records)
+        db.commit()
+
+        result = backtest_moving_average(
+            db=db,
+            facility_id=facility.id,
+            blood_group=group,
+            component=component,
+            horizon_days=7,
+            evaluation_days=3,
+            minimum_training_days=14,
+        )
+
+        assert result["available"] is False
+        assert result["evaluation_count"] == 0
+        assert result["skipped_incomplete_windows"] == 3
+        assert result["mae"] is None
+
+
+def test_backtest_returns_unavailable_with_insufficient_training_history(client):
+    from datetime import date, timedelta
+
+    with database.SessionLocal() as db:
+        facility = db.query(Facility).first()
+        assert facility is not None
+
+        group = "A+"
+        component = "red_blood_cells"
+        today = date.today()
+
+        db.query(DemandHistory).filter(
+            DemandHistory.facility_id == facility.id,
+            DemandHistory.blood_group == group,
+            DemandHistory.component == component,
+        ).delete(synchronize_session=False)
+
+        first_origin = today - timedelta(days=9)
+        history_start = first_origin - timedelta(days=28)
+
+        # Only 10 historical observations: below the required 14.
+        records = [
+            DemandHistory(
+                facility_id=facility.id,
+                blood_group=group,
+                component=component,
+                demand_date=history_start + timedelta(days=offset),
+                units_requested=2,
+            )
+            for offset in range(10)
+        ]
+
+        db.add_all(records)
+        db.commit()
+
+        result = backtest_moving_average(
+            db=db,
+            facility_id=facility.id,
+            blood_group=group,
+            component=component,
+            horizon_days=7,
+            evaluation_days=3,
+            minimum_training_days=14,
+        )
+
+        assert result["available"] is False
+        assert result["evaluation_count"] == 0
+        assert result["skipped_insufficient_history"] == 3
+        assert result["mae"] is None
+        assert result["rmse"] is None
+        assert result["wape"] is None
+
+
+@pytest.mark.parametrize("horizon_days", [7, 14, 30])
+def test_backtest_supports_different_forecast_horizons(client, horizon_days):
+    from datetime import date, timedelta
+
+    with database.SessionLocal() as db:
+        facility = db.query(Facility).first()
+        assert facility is not None
+
+        result = backtest_moving_average(
+            db=db,
+            facility_id=facility.id,
+            blood_group="A+",
+            component="red_blood_cells",
+            horizon_days=horizon_days,
+            evaluation_days=3,
+            minimum_training_days=14,
+        )
+
+        assert result["available"] is True
+        assert result["evaluation_count"] == 3
+
+        for item in result["results"]:
+            start = date.fromisoformat(item["target_start"])
+            end = date.fromisoformat(item["target_end"])
+
+            assert (end - start).days + 1 == horizon_days
+
+def test_backtest_endpoint_returns_forecast_metrics(client):
+    admin = login(client, "admin@bloodflow.demo", "DemoAdmin!2026")
+    headers = {"Authorization": f"Bearer {admin}"}
+
+    facilities = client.get(
+        "/api/facilities",
+        headers=headers,
+    ).json()
+
+    facility_id = facilities[0]["id"]
+
+    response = client.get(
+        "/api/forecasts/backtest",
+        headers=headers,
+        params={
+            "facility_id": facility_id,
+            "blood_group": "O+",
+            "component": "red_blood_cells",
+            "horizon_days": 7,
+            "evaluation_days": 30,
+        },
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+
+    assert data["available"] is True
+    assert data["evaluation_count"] > 0
+    assert data["mae"] is not None
+    assert data["rmse"] is not None
+    assert data["model"] == "trailing_28_day_daily_average"
+    assert len(data["results"]) == data["evaluation_count"]
+
+def test_backtest_endpoint_rejects_cross_facility_access(client):
+    token = login(client)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    facilities = client.get(
+        "/api/facilities",
+        headers=headers,
+    ).json()
+
+    kisumu_id = next(
+        item["id"]
+        for item in facilities
+        if item["county"] == "Kisumu"
+    )
+
+    response = client.get(
+        "/api/forecasts/backtest",
+        headers=headers,
+        params={"facility_id": kisumu_id},
+    )
+
+    assert response.status_code == 403
+
+
+def test_backtest_endpoint_requires_authentication(client):
+    response = client.get(
+        "/api/forecasts/backtest",
+        params={"facility_id": "test-facility"},
+    )
+
+    assert response.status_code == 401
