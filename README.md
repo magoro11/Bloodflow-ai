@@ -84,10 +84,13 @@ directory so both services deploy together. The backend entrypoint is
 `backend/app/main.py`.
 
 Set `DATABASE_URL` to a persistent PostgreSQL database and `JWT_SECRET` to a
-strong, unique secret in Vercel's environment settings. Do not use the local
-SQLite database or the development JWT secret in a deployment. Leave
-`NEXT_PUBLIC_API_URL` unset so the frontend uses the same-origin `/api` route;
-local development continues to use `http://localhost:8000`.
+strong, unique secret in Vercel's environment settings. Standard `postgres://`
+and `postgresql://` URLs are configured to use the installed psycopg 3 driver.
+Set `SEED_DEMO_DATA=false` for public deployments so local demo accounts are
+not created. Do not use the local SQLite database or the development JWT
+secret in a deployment. Leave `NEXT_PUBLIC_API_URL` unset so the frontend uses
+the same-origin `/api` route; local development continues to use
+`http://localhost:8000`.
 
 ## Tests and checks
 
