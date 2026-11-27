@@ -86,6 +86,9 @@ directory so both services deploy together. The backend entrypoint is
 Set `DATABASE_URL` to a persistent PostgreSQL database and `JWT_SECRET` to a
 strong, unique secret in Vercel's environment settings. Standard `postgres://`
 and `postgresql://` URLs are configured to use the installed psycopg 3 driver.
+Vercel deployments fail to start if `DATABASE_URL` is missing instead of
+silently falling back to SQLite, or if it points to SQLite instead of
+PostgreSQL.
 Set `SEED_DEMO_DATA=false` for public deployments so local demo accounts are
 not created. Do not use the local SQLite database or the development JWT
 secret in a deployment. Leave `NEXT_PUBLIC_API_URL` unset so the frontend uses
